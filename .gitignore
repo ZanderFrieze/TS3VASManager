@@ -1,0 +1,27 @@
+# CMake build output
+build/
+build_play/
+build_manual/
+TS3VASManagerServer/build/
+TS3VASManagerServer/build_manual/
+exe/build/
+exe/build_manual/
+
+# Compiled binaries (deployed to C:\ts3_tool\ by build scripts)
+*.dll
+*.exe
+*.lib
+*.exp
+*.pdb
+*.obj
+*.ilk
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+
+# Logs and telemetry (written to C:\ts3_tool\ and E:\...)
+*.log
+*.csv
+.claude/

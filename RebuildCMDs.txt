@@ -1,0 +1,5 @@
+build.bat   (builds both TS3VASManager.dll and TS3Launcher.exe — server retired)
+
+Individual targets, if needed:
+\TS3VASManager\TS3VASManager_build.bat   (DLL only)
+\TS3VASManager\exe\TS3Launcher_build.bat (launcher only)

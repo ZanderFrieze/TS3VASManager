@@ -1,0 +1,16 @@
+Copy these 9 files from https://github.com/microsoft/detours into this folder:
+
+    detours.h
+    detver.h
+    detours.cpp
+    creatwth.cpp
+    disasm.cpp
+    disolx86.cpp
+    disolx64.cpp
+    image.cpp
+    modules.cpp
+
+The x86 DLL and Launcher builds use: detours.cpp creatwth.cpp disasm.cpp
+    disolx86.cpp image.cpp modules.cpp   (disolx64.cpp is NOT compiled for x86)
+
+The x64 Server build does not use Detours at all.
