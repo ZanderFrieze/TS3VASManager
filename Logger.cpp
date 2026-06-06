@@ -104,9 +104,14 @@ Logger::~Logger() {
 }
 
 void Logger::AttachConsole() {
+#ifdef TS3VAS_TELEMETRY
+    // Debug/telemetry build only: pop a console mirroring the log stream.
+    // The play build (TS3VAS_TELEMETRY=OFF) stays windowless — file logging
+    // to C:\ts3_tool continues regardless of whether a console exists.
     if (AllocConsole()) {
-        SetConsoleTitleA("TS3Patch Debug Console");
+        SetConsoleTitleA("TS3VASManager Debug Console");
     }
+#endif
 }
 
 static void CreateLogDirectoryWithOpenPermissions() {

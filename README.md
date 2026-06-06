@@ -96,6 +96,16 @@ By default, the program outputs execution reports, error snapshots, and memory c
 
 ---
 
+## 🧪 Test Configuration & Reference Data
+
+To make the testing conditions transparent, the repository includes a real capture of everything loaded during a session — so you can see exactly what the tool is being exercised against rather than taking "heavily modded" on faith.
+
+[`docs/sample-logs/PACKAGE_LOAD.txt`](docs/sample-logs/PACKAGE_LOAD.txt) is an unedited `PACKAGE_LOAD` report (each distinct package/world logged once with its size) from a full-catalog, heavily-modded run: the complete NRaas script-mod suite, every base/EP/store world, and an active save (Storybrook County) whose `_sims` and `_objects` packages alone are ~500 MB each. This is a deliberately punishing load — the kind of configuration that reliably triggers "Error 12" on a stock 32-bit client.
+
+A companion line graph of `largest_free` / `total_free` VAS alongside the managed script-heap — captured over a multi-hour session — will be published here next to this report, so allocation pressure and the loaded content can be read together.
+
+---
+
 ## 🔍 Deprecated and Retired Legacy Subsystems
 
 As the architecture matured, several legacy features were removed or changed to preserve stability and optimize memory usage:
