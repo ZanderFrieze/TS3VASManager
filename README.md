@@ -113,3 +113,10 @@ As the architecture matured, several legacy features were removed or changed to 
 * **D3D9 activation trigger (now `ObserverHooks`)**: The D3D9 `Present` hook originally gated *when* the proxy went live. That dependency was removed — hooks now install at process start and `RtlAllocateHeap` catches allocations from the first instruction. The D3D9 hooks survive only as observe-only frame/resource telemetry, compiled into the debug/telemetry build and **enabled by default** there (set `TS3VAS_ENABLE_D3D9_HOOK=0` to disable).
 * **Proxy Slot Address Scanner**: Historically part of the `ProxyGc` module to check for abandoned objects inside the memory proxy region. Long-duration stress tests confirmed that memory blocks were consistently recycled cleanly by the game executable, yielding zero leaks inside the proxy, and leading to its complete removal.
 * **Vectored Exception Handling (VEH)**: A per-page lazy-commit fault handler originally monitored the proxy arena. Because the allocation matrix shifted to an enthusiastic eager-commit model, proxy address space pages never experience page faults, making the VEH subsystem completely obsolete.
+
+---
+
+## 🙏 Acknowledgements
+
+* **[cmedina-dev/TS3-64bit-Patch](https://github.com/cmedina-dev/TS3-64bit-Patch)** — the GPL-3.0 parent project this tool is derived from. See *Origins & Why This Exists* above for the lineage and the reasons behind the architectural divergence.
+* Development was assisted by AI coding tools — **Claude** (Anthropic) and **Codex** (OpenAI). They drafted and refactored code under human direction; authorship and copyright remain with the project's human maintainers.
