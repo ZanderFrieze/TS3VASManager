@@ -64,6 +64,39 @@ static CreateVertexBuffer_t  Real_CreateVertexBuffer  = nullptr;
 static CreateIndexBuffer_t   Real_CreateIndexBuffer   = nullptr;
 static std::atomic<bool>     g_resourceHooksInstalled(false);
 
+// ── Device-lost guard (vtable slot 37) ────────────────────────────────────────
+// The recurring crash is d3d9!CD3DBase::SetRenderTarget dispatching through a null
+// driver thunk (eip=0) after a GPU TDR / device-lost that Sims 3's old renderer
+// never guards with TestCooperativeLevel()+Reset().  We cannot Reset the game's
+// device for it (the game owns the DEFAULT-pool resources), but we CAN intercept
+// the exact faulting call: hook SetRenderTarget and, while the device reports lost,
+// return the cooperative-level error instead of letting d3d9 call through the null
+// slot.  Converts a guaranteed crash-to-desktop into a survivable no-render state.
+typedef HRESULT (WINAPI* SetRenderTarget_t)(IDirect3DDevice9*, DWORD, IDirect3DSurface9*);
+static SetRenderTarget_t  Real_SetRenderTarget = nullptr;
+static std::atomic<bool>  g_deviceGuard(true);     // TS3VAS_D3D9_DEVICE_GUARD=0 disables
+static std::atomic<bool>  g_deviceLost(false);     // last observed cooperative state
+static std::atomic<DWORD> g_deviceLostEvents(0);   // # of OK->lost transitions logged
+static std::atomic<DWORD> g_guardedCallCount(0);   // # of d3d9 calls short-circuited
+
+// Update the cached lost flag from a TestCooperativeLevel() result, logging the
+// OK<->lost transitions exactly once each (never per-frame spam).
+static void NoteCoopLevel(HRESULT coop) {
+    const bool lost = (coop != D3D_OK);
+    const bool was  = g_deviceLost.exchange(lost);
+    if (lost && !was) {
+        g_deviceLostEvents.fetch_add(1);
+        if (Logger::GetInstance())
+            Logger::GetInstance()->Warn(
+                "[D3D9] DEVICE LOST (TestCooperativeLevel=0x%08X) — render calls guarded; "
+                "SetRenderTarget shielded from null driver dispatch. Awaiting device reset.",
+                coop);
+    } else if (!lost && was) {
+        if (Logger::GetInstance())
+            Logger::GetInstance()->Info("[D3D9] Device recovered (TestCooperativeLevel=D3D_OK).");
+    }
+}
+
 static DWORD ResolveTargetFps() {
     if (!g_capInit.exchange(true)) {
         char value[32] = {};
@@ -91,6 +124,41 @@ static DWORD ResolveTargetFps() {
         }
     }
     return g_targetFps.load();
+}
+
+// Park the render thread until `remainingTicks` (QPC units) elapse, WITHOUT a
+// busy-spin. A high-resolution waitable timer (~0.5ms, Win10 1803+) lets the
+// scheduler sleep the thread and wake it on time, so we pace frames without
+// pinning a CPU core (the old SwitchToThread tail did, adding heat under load).
+// No process-global timeBeginPeriod side effect. The timer is created once per
+// render thread and reused; falls back to a coarse Sleep if it can't be made.
+static void FrameCapWait(LONGLONG remainingTicks) {
+    if (remainingTicks <= 0 || g_qpcFrequency.QuadPart <= 0) return;
+    // QPC ticks -> 100ns units for SetWaitableTimer's relative due time.
+    const LONGLONG hundredNs =
+        (remainingTicks * 10000000LL) / g_qpcFrequency.QuadPart;
+    if (hundredNs <= 0) return;
+
+    static thread_local HANDLE s_timer = nullptr;
+    static thread_local bool   s_tried = false;
+    if (!s_timer && !s_tried) {
+        s_tried = true;
+        s_timer = CreateWaitableTimerExW(nullptr, nullptr,
+            CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        if (!s_timer)  // pre-1803: fall back to a standard waitable timer
+            s_timer = CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS);
+    }
+    if (s_timer) {
+        LARGE_INTEGER due;
+        due.QuadPart = -hundredNs;  // negative = relative time
+        if (SetWaitableTimer(s_timer, &due, 0, nullptr, nullptr, FALSE)) {
+            WaitForSingleObject(s_timer, INFINITE);
+            return;
+        }
+    }
+    // Last-resort fallback: coarse millisecond sleep (never busy-spin).
+    const DWORD ms = (DWORD)(hundredNs / 10000LL);
+    if (ms > 0) Sleep(ms);
 }
 
 HRESULT WINAPI Hooked_Present(
@@ -142,21 +210,25 @@ HRESULT WINAPI Hooked_Present(
         }
     }
 
-    // Optional FPS cap (default 60). Set TS3VAS_FPS_CAP=0 to disable.
-    if (targetFps > 0 && g_qpcFrequency.QuadPart > 0 && g_lastPresentTime.QuadPart > 0) {
+    // Device-lost probe: TestCooperativeLevel is the canonical recovery-loop query
+    // and is safe to call on a lost device.  Drives the SetRenderTarget shield and
+    // lets us skip the FPS busy-spin so we don't pin a core during a freeze.
+    bool deviceLost = false;
+    if (g_deviceGuard.load(std::memory_order_relaxed) && pDevice) {
+        const HRESULT coop = pDevice->TestCooperativeLevel();
+        NoteCoopLevel(coop);
+        deviceLost = (coop != D3D_OK);
+    }
+
+    // Optional FPS cap (default 60). Set TS3VAS_FPS_CAP=0 to disable. Skipped while
+    // the device is lost — pacing during a freeze is pointless. The wait is a
+    // blocking high-res timer (FrameCapWait), not a busy-spin, so it never pins a core.
+    if (!deviceLost && targetFps > 0 && g_qpcFrequency.QuadPart > 0 && g_lastPresentTime.QuadPart > 0) {
         const LONGLONG targetTicks = (LONGLONG)(g_qpcFrequency.QuadPart / (LONGLONG)targetFps);
         const LONGLONG elapsedTicks = currentTime.QuadPart - g_lastPresentTime.QuadPart;
         if (elapsedTicks < targetTicks) {
-            LONGLONG remainingTicks = targetTicks - elapsedTicks;
-            DWORD remainingMs = (DWORD)((remainingTicks * 1000) / g_qpcFrequency.QuadPart);
-            if (remainingMs > 1) Sleep(remainingMs - 1);
-
-            LARGE_INTEGER now2;
-            do {
-                SwitchToThread();
-                QueryPerformanceCounter(&now2);
-            } while ((now2.QuadPart - g_lastPresentTime.QuadPart) < targetTicks);
-            currentTime = now2;
+            FrameCapWait(targetTicks - elapsedTicks);
+            QueryPerformanceCounter(&currentTime);  // re-read post-wait for accurate pacing baseline
         }
     }
 
@@ -278,6 +350,24 @@ HRESULT WINAPI Hooked_CreateIndexBuffer(IDirect3DDevice9* dev, UINT Len, DWORD U
     if (SUCCEEDED(hr) && !WorkingHooks::IsShuttingDown())
         TallyResource("IndexBuf", Pool, Len, (Usage & D3DUSAGE_DYNAMIC) != 0);
     return hr;
+}
+
+// Vtable slot 37 — the recurring crash site.  When the device is lost, d3d9's real
+// SetRenderTarget dispatches through a null driver thunk and the process dies at
+// eip=0.  Probe cooperative level first (fresh, so a mid-frame loss is caught even
+// if Present hasn't run since) and short-circuit before the null dispatch.
+HRESULT WINAPI Hooked_SetRenderTarget(IDirect3DDevice9* dev, DWORD index,
+                                      IDirect3DSurface9* pRenderTarget) {
+    if (!Real_SetRenderTarget) return D3DERR_INVALIDCALL;
+    if (g_deviceGuard.load(std::memory_order_relaxed) && dev) {
+        const HRESULT coop = dev->TestCooperativeLevel();
+        if (coop != D3D_OK) {
+            NoteCoopLevel(coop);            // keep the cached flag fresh mid-frame
+            g_guardedCallCount.fetch_add(1);
+            return coop;                    // skip the null driver dispatch — survive the frame
+        }
+    }
+    return Real_SetRenderTarget(dev, index, pRenderTarget);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -601,6 +691,7 @@ bool ObserverHooks::Install() {
     void* cubeTexAddr = vtbl[25];
     void* vbAddr      = vtbl[26];
     void* ibAddr      = vtbl[27];
+    void* srtAddr     = vtbl[37];  // SetRenderTarget — device-lost crash-site shield
     pD3D->Release();
     pDev->Release();
 
@@ -614,11 +705,23 @@ bool ObserverHooks::Install() {
             hookResources = false;
     }
 
+    // Device-lost crash shield is on by default. Set TS3VAS_D3D9_DEVICE_GUARD=0 to disable.
+    {
+        char v[8] = {};
+        DWORD n = GetEnvironmentVariableA("TS3VAS_D3D9_DEVICE_GUARD", v, (DWORD)sizeof(v));
+        if (n > 0 && (v[0] == '0' || v[0] == 'n' || v[0] == 'N' || v[0] == 'f' || v[0] == 'F'))
+            g_deviceGuard.store(false);
+    }
+
     // Initialise the Real_ pointers then attach via one Detours transaction.
     Real_Present = reinterpret_cast<Present_t>(presentAddr);
     DetourTransactionBegin();
     DetourUpdateThread(GetCurrentThread());
     DetourAttach(&(PVOID&)Real_Present, Hooked_Present);
+    if (g_deviceGuard.load()) {
+        Real_SetRenderTarget = reinterpret_cast<SetRenderTarget_t>(srtAddr);
+        DetourAttach(&(PVOID&)Real_SetRenderTarget, Hooked_SetRenderTarget);
+    }
     if (hookResources) {
         Real_CreateTexture       = reinterpret_cast<CreateTexture_t>(texAddr);
         Real_CreateVolumeTexture = reinterpret_cast<CreateVolumeTexture_t>(volTexAddr);
@@ -634,7 +737,13 @@ bool ObserverHooks::Install() {
     if (DetourTransactionCommit() != NO_ERROR) {
         Logger::GetInstance()->Error("[D3D9] Detours attach failed.");
         Real_Present = nullptr;
+        Real_SetRenderTarget = nullptr;
         return false;
+    }
+    if (g_deviceGuard.load() && Real_SetRenderTarget) {
+        Logger::GetInstance()->Info(
+            "[D3D9] Device-lost guard ON — SetRenderTarget (slot 37) shielded against "
+            "null driver dispatch. Set TS3VAS_D3D9_DEVICE_GUARD=0 to disable.");
     }
     if (hookResources) {
         g_resourceHooksInstalled.store(true);
@@ -669,14 +778,18 @@ void ObserverHooks::Uninstall() {
     DetourTransactionBegin();
     DetourUpdateThread(GetCurrentThread());
     DetourDetach(&(PVOID&)Real_Present, Hooked_Present);
+    if (Real_SetRenderTarget) DetourDetach(&(PVOID&)Real_SetRenderTarget, Hooked_SetRenderTarget);
     DetourTransactionCommit();
 
     if (Logger::GetInstance()) {
         DWORD p = g_presentCallCount.load(), h = g_hitchCount.load();
         Logger::GetInstance()->Info("[D3D9] Hitch hook removed. Frames=%lu Hitches=%lu (%.2f%%)",
             p, h, p > 0 ? h * 100.0f / p : 0.0f);
+        Logger::GetInstance()->Info("[D3D9] Device-lost events=%lu  guarded SetRenderTarget calls=%lu",
+            g_deviceLostEvents.load(), g_guardedCallCount.load());
     }
     Real_Present = nullptr;
+    Real_SetRenderTarget = nullptr;
     g_installed.store(false);
     if (g_hD3D9) {
         FreeLibrary(g_hD3D9);

@@ -361,7 +361,12 @@ LPVOID ProxyAllocator::Allocate(SIZE_T size, bool fromTop) {
       m_bandSlotBytes[b] += grantedSize; }
     m_activeAllocations++;
     m_totalGrantedBytes += grantedSize;
-    if (m_hasMainArenaFree) m_totalReusedBytes += grantedSize;
+    // Reuse is tallied ONLY on a true size-class cache hit, at the PopSizeClass branch
+    // above (m_totalReusedBytes += grantedSize).  The old unconditional line here —
+    //   if (m_hasMainArenaFree) m_totalReusedBytes += grantedSize;
+    // double-counted those cache hits AND counted every fresh carve as "reuse", which
+    // pushed reuse_rate (= reused/granted, must be <=100%) past 100% (the 141-192% we
+    // kept seeing).  Removed 2026-06-06 so reuse_rate reads as a true 0-100% fraction.
     LeaveCriticalSection(&m_cs);
     DecTlsDepth();
     ProxyAllocatorTrace::Mark(0x3006, nullptr, (SIZE_T)grantedAddr, grantedSize, 0, GetContextTag());
