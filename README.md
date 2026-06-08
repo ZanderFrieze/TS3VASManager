@@ -104,6 +104,14 @@ To make the testing conditions transparent, the repository includes a real captu
 
 A companion line graph of `largest_free` / `total_free` VAS alongside the managed script-heap — captured over a multi-hour session — will be published here next to this report, so allocation pressure and the loaded content can be read together.
 
+### How to read the VAS numbers in the graph
+
+`total_free` and `largest_free` are **the address space left to the *game*, not to the whole process** — measured *after* the proxy has already taken its share. The heartbeat thread walks the process address space (`VirtualQuery`) and sums **only the regions in the `MEM_FREE` state** — address space that is neither reserved nor committed. `total_free` is the sum of every free region; `largest_free` is the single biggest *contiguous* free block (the one that matters for a large allocation, and usually the first thing to fail — it's why "Error 12" can strike with hundreds of MB still nominally free but no single block big enough).
+
+Crucially, the tool reserves its **contiguous 1 GB proxy arena up front**, for the entire life of the process. A reservation is not `MEM_FREE`, so the arena — every byte of it, whether currently holding a redirected allocation or sitting empty inside — is **excluded from these two numbers by design**. In other words, the graph shows the headroom the game has *to grow into* once two things have already been subtracted: the ~1 GB the proxy claimed, and whatever the loaded save / new game pulled in during world-load. A run that boots with ~2 GB free settling to ~1 GB after load and the arena reservation is normal and healthy — that ~1 GB is the runway, and the whole point of the tool is to keep large allocations *out* of it so it drains slowly.
+
+The arena's own internal free space is a **separate pool** and is **not** part of `total_free` / `largest_free`. It is reported on its own in the `PROXY_ARENA_REPORT` channel (`used` / `free` / `largest_free` *inside* the 1 GB reservation). Because the arena recycles allocations internally, that pool stays roughly flat while the game's unproxied VAS is what the graph tracks bleeding away over a session. True total headroom, if you want it, is the graphed `total_free` plus the arena's reported internal `free`.
+
 ---
 
 ## 🔍 Deprecated and Retired Legacy Subsystems
