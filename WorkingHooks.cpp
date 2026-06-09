@@ -165,29 +165,14 @@ struct HeapUseRec {
 // into the proxy arena (a per-heap corral), regardless of size — pulls that
 // subsystem's memory out of the loose VAS.  Extend the list to corral more heaps.
 static bool IsCorralModule(const char* m) {
-    if (!m || !m[0]) return false;
-    char up[40];
-    size_t i = 0;
-    for (; m[i] && i + 1 < sizeof(up); ++i) up[i] = (char)toupper((unsigned char)m[i]);
-    up[i] = 0;
-    if (strstr(up, "DSOUND")) {
-        // Experiment (TS3VAS_SARDINE_DSOUND=1): route DSOUND.dll's heap to the sardine
-        // shards (sub-64KB LFH packing) instead of corralling its whole heap into the
-        // arena.  Default (env unset) keeps the corral.  WARNING: DSOUND is audio-
-        // driver-adjacent — if it hands heap pointers down to the kernel audio path the
-        // way AMDXN32 hands them to the GPU, an in-arena shard can get its header smashed
-        // (same class as xcpt DRAKKAR).  Watch for a DSOUND -> our hook -> ntdll heap AV;
-        // if it appears, set this back to 0 (and DSOUND likely needs HeapIsSardineExcluded).
-        static volatile LONG s_sardineDsound = -1;
-        LONG v = InterlockedCompareExchange(&s_sardineDsound, 0, 0);
-        if (v < 0) {
-            char e[8] = {};
-            DWORD n = GetEnvironmentVariableA("TS3VAS_SARDINE_DSOUND", e, (DWORD)sizeof(e));
-            v = (n > 0 && (e[0]=='1'||e[0]=='y'||e[0]=='Y'||e[0]=='t'||e[0]=='T')) ? 1 : 0;
-            InterlockedExchange(&s_sardineDsound, v);
-        }
-        return v == 0;   // corral DSOUND unless the sardine experiment is enabled
-    }
+    // No heaps are corralled by default.  DSOUND USED to be corralled here, but its heap
+    // pointers cross into the kernel audio path and it calls RtlSetUserValueHeap /
+    // RtlGetUserInfoHeap on them (which need real ntdll blocks) — corralling its whole
+    // heap into the arena corrupted the heap and crashed (xcpt DRAKKAR 26-06-09).  DSOUND
+    // and the rest of the audio subsystem are now kept fully hands-off via IsAudioModule
+    // (excluded from corral, sardine, AND arena capture).  Re-add a heap here only if its
+    // memory NEVER crosses into a driver/kernel command path.
+    (void)m;
     return false;
 }
 
@@ -219,6 +204,25 @@ static bool IsGraphicsModule(const char* m) {
         // Intel integrated GPU user-mode drivers
         StringContainsI(m, "igd10")       || StringContainsI(m, "igdumd");
 }
+
+// Audio subsystem modules — driver-adjacent the SAME way graphics drivers are: DSOUND /
+// AUDIOSES / wdmaud hand their heap blocks down to the kernel audio path and call
+// RtlSetUserValueHeap / RtlGetUserInfoHeap on them, which require a REAL ntdll heap
+// block.  Capturing those allocs into the proxy arena or a sardine shard makes those
+// APIs fail ("Invalid address specified to RtlSetUserValueHeap( ... )") and corrupts the
+// heap -> AV (xcpt DRAKKAR 26-06-09: DSOUND -> winmmbase -> RPCRT4 -> our hook -> ntdll
+// heap, write 0xfffffff8).  So audio is kept fully hands-off: no corral, no sardine, no
+// arena capture.  Substrings match the .dll and .drv variants.
+static bool IsAudioModule(const char* m) {
+    if (!m || !m[0]) return false;
+    return
+        StringContainsI(m, "dsound")     || StringContainsI(m, "audioses")  ||
+        StringContainsI(m, "mmdevapi")   || StringContainsI(m, "wdmaud")    ||
+        StringContainsI(m, "winmm")      || StringContainsI(m, "msacm")     ||
+        StringContainsI(m, "midimap")    || StringContainsI(m, "avrt")      ||
+        StringContainsI(m, "msdmo")      || StringContainsI(m, "resampledmo")||
+        StringContainsI(m, "audioeng");
+}
 static const int        kHeapUseMax = 128;
 static HeapUseRec       s_heapUse[kHeapUseMax];
 static volatile LONG    s_heapUseCount = 0;
@@ -242,7 +246,7 @@ static void DiagInit() {
 // ON A MISS via GetModuleHandleEx and cached with its [base,end)+gfx flag — so a
 // driver that loads LATE (AMDXN32 comes up during D3D9 init, after d3d9/dxgi) is
 // still caught on its very first call, not skipped because the cache froze early.
-struct CallerModRange { UINT_PTR base, end; bool gfx; };
+struct CallerModRange { UINT_PTR base, end; bool gfx; bool audio; };
 static const int      kCallerModMax = 256;
 static CallerModRange s_callerMods[kCallerModMax];
 static volatile LONG  s_callerModCount = 0;
@@ -266,6 +270,7 @@ static bool CallerIsGraphicsModule(void* ra) {
     char name[64] = {};
     GetModuleBaseNameA(GetCurrentProcess(), mod, name, sizeof(name));
     const bool gfx = IsGraphicsModule(name);
+    const bool aud = IsAudioModule(name);
 
     EnterCriticalSection(&s_heapUseCS);
     bool known = false;
@@ -276,11 +281,28 @@ static bool CallerIsGraphicsModule(void* ra) {
         s_callerMods[m].base = (UINT_PTR)mi.lpBaseOfDll;
         s_callerMods[m].end  = (UINT_PTR)mi.lpBaseOfDll + mi.SizeOfImage;
         s_callerMods[m].gfx  = gfx;
+        s_callerMods[m].audio = aud;
         MemoryBarrier();                             // publish fields before the count
         s_callerModCount = m + 1;
     }
     LeaveCriticalSection(&s_heapUseCS);
     return gfx;
+}
+
+// Audio counterpart of CallerIsGraphicsModule.  Reuses the SAME per-module cache —
+// CallerIsGraphicsModule's resolver records both the gfx and audio flags in one pass —
+// so a miss here just triggers that resolve and re-scans.
+static bool CallerIsAudioModule(void* ra) {
+    if (!ra || !s_diagCSInit) return false;
+    const UINT_PTR a = (UINT_PTR)ra;
+    LONG n = s_callerModCount;                       // lock-free fast path (append-only)
+    for (LONG i = 0; i < n; ++i)
+        if (a >= s_callerMods[i].base && a < s_callerMods[i].end) return s_callerMods[i].audio;
+    CallerIsGraphicsModule(ra);                      // resolve+cache both flags for this module
+    n = s_callerModCount;
+    for (LONG i = 0; i < n; ++i)
+        if (a >= s_callerMods[i].base && a < s_callerMods[i].end) return s_callerMods[i].audio;
+    return false;
 }
 
 // Thread-local cache of the last heap touched — the common case is a run of allocs
@@ -333,7 +355,8 @@ static bool RecordHeapUse(PVOID heap, SIZE_T size, void* retAddr) {
         }
         strncpy_s(s_heapUse[idx].module, m[0] ? m : "<?>", _TRUNCATE);
         s_heapUse[idx].corralTarget   = IsCorralModule(s_heapUse[idx].module);
-        s_heapUse[idx].sardineExclude = IsGraphicsModule(s_heapUse[idx].module);
+        s_heapUse[idx].sardineExclude = IsGraphicsModule(s_heapUse[idx].module) ||
+                                        IsAudioModule(s_heapUse[idx].module);
         MemoryBarrier();
         s_heapUseCount = n + 1;              // publish only after fields are set
     }
@@ -1937,7 +1960,8 @@ PVOID NTAPI Hooked_RtlAllocateHeap(PVOID HeapHandle, ULONG Flags, SIZE_T Size)
     // (malloc-granular) instead of a 64KB arena slot each.  Exec heaps are skipped
     // (their allocs are code).  All shards full → fall through to the arena gate.
     if (ProxyHeapOn() && Size > 0 && Size < kHeapSubAllocMax && !ProxyHeapIsExecHeap(HeapHandle)
-        && !HeapIsSardineExcluded(HeapHandle) && !CallerIsGraphicsModule(callerRA)) {
+        && !HeapIsSardineExcluded(HeapHandle) && !CallerIsGraphicsModule(callerRA)
+        && !CallerIsAudioModule(callerRA)) {
         PVOID hp = ProxyHeapAlloc(Flags, Size);
         if (hp) {
             if (Analytics::GetInstance()) {
@@ -1986,7 +2010,8 @@ PVOID NTAPI Hooked_RtlAllocateHeap(PVOID HeapHandle, ULONG Flags, SIZE_T Size)
 
         bool craAttempted = false;
         if (WorkingHooks::IsProxyActive()) {
-            if (Size > 0 && (Size >= 64 * 1024 || (IsForceHeapProxyMode() && Size >= kForceHeapProxyMinSize))) {
+            if (Size > 0 && !IsAudioModule(moduleName)   // audio stays in the real heap (see IsAudioModule)
+                && (Size >= 64 * 1024 || (IsForceHeapProxyMode() && Size >= kForceHeapProxyMinSize))) {
                 // Classify the allocation lane from caller kind:
                 // Graphics driver allocations → Lane A (pinned, never evicted).
                 // Everything else → Lane B (evictable via LRU).
