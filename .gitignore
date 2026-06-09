@@ -27,3 +27,12 @@ exe/build_manual/
 # published graph data — tracked on purpose
 !docs/vas_comparison.csv
 .claude/
+
+# Scratch notes (local build-flavor reminders, not for the repo)
+crash
+lean
+
+# Detours: users supply their own source from https://github.com/microsoft/detours
+# (CMakeLists.txt errors with instructions if missing). Track only the placeholder.
+extern/detours/src/*
+!extern/detours/src/PLACE_DETOURS_HERE.txt
