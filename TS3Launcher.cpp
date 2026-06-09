@@ -49,7 +49,13 @@ static const DWORD    PRE_INJECT_SLEEP_MS   = 500;    // brief pause before inje
 static const char* EXE_DIRECT  = "TS3W.exe";    // 1.67 disc / 1.70 Steam
 static const char* EXE_MONITOR = "TS3.exe";     // 1.69 EA/Origin
 static const char* EXE_EALAUN  = "Sims3Launcher.exe"; // 1.69 intermediate launcher
-static const char* DLL_NAME    = "TS3VASManager.dll";
+// Injection DLL. The telemetry build deploys as TS3VASManager.dll and the lean
+// play build as TS3VASManager_play.dll — distinct filenames. Try them in order;
+// the first one present in Game\Bin wins (telemetry preferred when both exist).
+static const char* DLL_CANDIDATES[] = {
+    "TS3VASManager.dll",        // telemetry / diagnostic build
+    "TS3VASManager_play.dll",   // lean play build
+};
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -223,7 +229,15 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    snprintf(dllPath, MAX_PATH, "%s\\%s", selfDir, DLL_NAME);
+    // Resolve which injection DLL is actually present (telemetry build first,
+    // then the play build). Falls back to the first name for the error path below.
+    const char* dllName = DLL_CANDIDATES[0];
+    for (const char* cand : DLL_CANDIDATES) {
+        char tryPath[MAX_PATH] = {};
+        snprintf(tryPath, MAX_PATH, "%s\\%s", selfDir, cand);
+        if (FileExists(tryPath)) { dllName = cand; break; }
+    }
+    snprintf(dllPath, MAX_PATH, "%s\\%s", selfDir, dllName);
 
     // ── Step 2: Auto-detect game exe and injection mode ───────────────────────
     char directPath [MAX_PATH] = {};
@@ -250,7 +264,7 @@ int main(int argc, char* argv[]) {
         printf("[ERROR] Neither %s nor %s found in:\n", EXE_DIRECT, EXE_MONITOR);
         printf("        %s\n\n", selfDir);
         printf("  All three files must be in the same Game\\Bin folder:\n");
-        printf("    TS3Launcher.exe  TS3VASManager.dll\n");
+        printf("    TS3Launcher.exe  TS3VASManager.dll (or _play.dll)\n");
         printf("    TS3W.exe (disc/Steam)  OR  TS3.exe (EA/Origin)\n");
         system("pause");
         return 1;
@@ -260,9 +274,11 @@ int main(int argc, char* argv[]) {
 
     // ── Step 3: Verify DLL exists ─────────────────────────────────────────────
     if (!FileExists(dllPath)) {
-        printf("[ERROR] Injection DLL not found:\n        %s\n\n", dllPath);
+        printf("[ERROR] Injection DLL not found in:\n        %s\n\n", selfDir);
+        printf("  Expected one of: %s  or  %s\n",
+               DLL_CANDIDATES[0], DLL_CANDIDATES[1]);
         printf("  Build TS3VASManager first (run TS3VASManager_build.bat),\n");
-        printf("  then copy TS3VASManager.dll into:\n  %s\n", selfDir);
+        printf("  then copy the DLL into:\n  %s\n", selfDir);
         system("pause");
         return 1;
     }
@@ -376,8 +392,8 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        printf("\n[OK] TS3VASManager.dll injected into %s (PID %lu)\n",
-               gameExeName, pid);
+        printf("\n[OK] %s injected into %s (PID %lu)\n",
+               dllName, gameExeName, pid);
         printf("[OK] Hooks installing via DllMain.\n");
     }
 
