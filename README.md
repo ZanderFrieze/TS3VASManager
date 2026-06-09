@@ -102,7 +102,11 @@ To make the testing conditions transparent, the repository includes a real captu
 
 [`docs/sample-logs/PACKAGE_LOAD.txt`](docs/sample-logs/PACKAGE_LOAD.txt) is an unedited `PACKAGE_LOAD` report (each distinct package/world logged once with its size) from a full-catalog, heavily-modded run: the complete NRaas script-mod suite, every base/EP/store world, and an active save (Storybrook County) whose `_sims` and `_objects` packages alone are ~500 MB each. This is a deliberately punishing load — the kind of configuration that reliably triggers "Error 12" on a stock 32-bit client.
 
-A companion line graph of `largest_free` / `total_free` VAS alongside the managed script-heap — captured over a multi-hour session — will be published here next to this report, so allocation pressure and the loaded content can be read together.
+A companion line graph captures `largest_free` / `total_free` VAS alongside the managed script-heap, so allocation pressure and the loaded content can be read together:
+
+![VAS over a session — three runs, three metrics each](docs/vas_comparison.png)
+
+Nine lines: **three real play sessions, three metrics each.** Each run is a base colour — **red** = Main PC (v1.67) under the full content catalog, **green** = Main PC (v1.67) on a fresh Riverview save, **blue** = ROG Ally X handheld (v1.69) on a fresh Riverview save. Within a run, the three shades are `largest_free` (darkest), `total_free` (mid) and `script_heap` (lightest). Each session is plotted at its **full, individual length** (the length is the point), with the current **2–3 hour recommended window shaded** for reference — every line runs well past it, to 5:10, 5:33 and 6:02. The raw data and the script that produced this chart live in [`docs/vas_comparison.csv`](docs/vas_comparison.csv) and [`docs/make_vas_graph.py`](docs/make_vas_graph.py).
 
 ### How to read the VAS numbers in the graph
 

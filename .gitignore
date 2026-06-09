@@ -24,4 +24,6 @@ exe/build_manual/
 # Logs and telemetry (written to C:\ts3_tool\ and E:\...)
 *.log
 *.csv
+# published graph data — tracked on purpose
+!docs/vas_comparison.csv
 .claude/
