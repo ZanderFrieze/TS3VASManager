@@ -99,12 +99,13 @@ ax.set_xlim(0, max_x)                 # x starts at the 0 origin
 ax.set_ylim(0, max_y * 1.02)          # y starts at the 0 origin
 ax.xaxis.set_major_locator(MultipleLocator(30))   # a tick every 30 min
 ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _: hm(v)))
+ax.yaxis.set_major_locator(MultipleLocator(50))   # MB gridlines every 50
 
 ax.axvspan(0, 180, color="0.92", zorder=0)        # 2-3h "recommended" window
 ax.text(90, max_y * 0.03, "current 2-3h\nrecommended window",
         ha="center", va="bottom", fontsize=8, color="0.4")
 
-plt.title("The Sims 3 (32-bit) VAS over a session — 3 runs x 3 metrics\n"
+plt.title("The Sims 3 (32-bit) VAS over a session\n"
           "remaining address space left to the GAME after the proxy's 1 GB arena "
           "(MEM_FREE only); runs kept at full length", fontsize=11)
 plt.xlabel("elapsed time from run start (H:MM)")
