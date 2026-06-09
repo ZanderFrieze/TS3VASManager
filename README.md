@@ -85,7 +85,11 @@ The project workspace requires distinct architectural build setups due to the ta
    * **Steam Defaults**: `C:\Program Files (x86)\Steam\steamapps\common\The Sims 3\Game\Bin`
 2. Copy the compiled components into this game binary path:
    * `TS3Launcher.exe`
-   * `TS3VASManager.dll` (the play build, or the telemetry build if you want diagnostic logs)
+   * **One** injection DLL — your choice, and no renaming required:
+     * `TS3VASManager_play.dll` — the lean **play** build for everyday play, **or**
+     * `TS3VASManager.dll` — the **telemetry** build, which writes full diagnostic logs to `C:\ts3_tool\`
+
+   `TS3Launcher.exe` auto-detects and injects whichever of the two DLLs is present in the folder — drop in the one you want and run. (If both happen to be present, the telemetry build takes precedence.)
 3. **Execution**: Always run your game using `TS3Launcher.exe`. 
    * *Note*: If you encounter injection errors, process boundary issues, or missing function targets, right-click `TS3Launcher.exe` and select **Run as Administrator**.
 
