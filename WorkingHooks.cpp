@@ -38,6 +38,13 @@ typedef LPVOID  (WINAPI *HeapReAlloc_t)            (HANDLE, DWORD, LPVOID, SIZE_
 typedef HANDLE  (WINAPI *HeapCreate_t)             (DWORD, SIZE_T, SIZE_T);
 typedef BOOL    (WINAPI *HeapDestroy_t)            (HANDLE);
 typedef SIZE_T  (WINAPI *HeapSize_t)               (HANDLE, DWORD, LPCVOID);
+// Global/Local movable handles: the block must stay a real heap block so the
+// internal RtlSetUserValueHeap linkage works. We hook these only to run them with
+// proxy redirection suppressed (see Hooked_GlobalAlloc), never to redirect.
+typedef HGLOBAL (WINAPI *GlobalAlloc_t)            (UINT, SIZE_T);
+typedef HGLOBAL (WINAPI *GlobalReAlloc_t)          (HGLOBAL, SIZE_T, UINT);
+typedef HLOCAL  (WINAPI *LocalAlloc_t)             (UINT, SIZE_T);
+typedef HLOCAL  (WINAPI *LocalReAlloc_t)           (HLOCAL, SIZE_T, UINT);
 typedef BOOL    (WINAPI *HeapValidate_t)           (HANDLE, DWORD, LPCVOID);
 typedef SIZE_T  (WINAPI *HeapCompact_t)            (HANDLE, DWORD);
 typedef BOOL    (WINAPI *HeapWalk_t)               (HANDLE, LPPROCESS_HEAP_ENTRY);
@@ -76,6 +83,10 @@ static HeapAlloc_t               Real_HeapAlloc               = nullptr;
 static HeapFree_t                Real_HeapFree                = nullptr;
 static HeapReAlloc_t             Real_HeapReAlloc             = nullptr;
 static HeapCreate_t              Real_HeapCreate              = nullptr;
+static GlobalAlloc_t             Real_GlobalAlloc             = nullptr;
+static GlobalReAlloc_t           Real_GlobalReAlloc           = nullptr;
+static LocalAlloc_t              Real_LocalAlloc              = nullptr;
+static LocalReAlloc_t            Real_LocalReAlloc            = nullptr;
 static HeapDestroy_t             Real_HeapDestroy             = nullptr;
 static HeapSize_t                Real_HeapSize                = nullptr;
 static HeapValidate_t            Real_HeapValidate            = nullptr;
@@ -219,6 +230,57 @@ static void DiagInit() {
         InitializeCriticalSection(&s_heapUseCS);
         s_diagCSInit = true;
     }
+}
+
+// ── Caller-based graphics exclusion (sardine backstop) ───────────────────────
+// HeapIsSardineExcluded tags a heap by its FIRST-seen caller, which is racy for a
+// heap SHARED by a graphics driver and other code. The lean play build (no observe
+// layer to shift startup timing) loses that race, so AMDXN32 allocs slip into the
+// sardine and smash the LFH freelist (the RtlpAllocateHeap / RtlTryEnterCriticalSection
+// AVs at a bogus address). Backstop: reject the sardine when the IMMEDIATE caller's
+// return address lies in a graphics-driver module. Each caller module is resolved
+// ON A MISS via GetModuleHandleEx and cached with its [base,end)+gfx flag — so a
+// driver that loads LATE (AMDXN32 comes up during D3D9 init, after d3d9/dxgi) is
+// still caught on its very first call, not skipped because the cache froze early.
+struct CallerModRange { UINT_PTR base, end; bool gfx; };
+static const int      kCallerModMax = 256;
+static CallerModRange s_callerMods[kCallerModMax];
+static volatile LONG  s_callerModCount = 0;
+
+static bool CallerIsGraphicsModule(void* ra) {
+    if (!ra || !s_diagCSInit) return false;
+    const UINT_PTR a = (UINT_PTR)ra;
+    LONG n = s_callerModCount;                       // lock-free fast path (append-only)
+    for (LONG i = 0; i < n; ++i)
+        if (a >= s_callerMods[i].base && a < s_callerMods[i].end) return s_callerMods[i].gfx;
+
+    // Miss: resolve THIS caller's module once and cache it. Modules are finite, so the
+    // GetModuleHandleEx + lock happens only on first sighting of each caller module.
+    HMODULE mod = nullptr;
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            (LPCSTR)a, &mod) || !mod)
+        return false;                                // dynamic/JIT code — no owning module
+    MODULEINFO mi = {};
+    if (!GetModuleInformation(GetCurrentProcess(), mod, &mi, sizeof(mi))) return false;
+    char name[64] = {};
+    GetModuleBaseNameA(GetCurrentProcess(), mod, name, sizeof(name));
+    const bool gfx = IsGraphicsModule(name);
+
+    EnterCriticalSection(&s_heapUseCS);
+    bool known = false;
+    LONG m = s_callerModCount;
+    for (LONG j = 0; j < m; ++j)
+        if (s_callerMods[j].base == (UINT_PTR)mi.lpBaseOfDll) { known = true; break; }
+    if (!known && m < kCallerModMax) {
+        s_callerMods[m].base = (UINT_PTR)mi.lpBaseOfDll;
+        s_callerMods[m].end  = (UINT_PTR)mi.lpBaseOfDll + mi.SizeOfImage;
+        s_callerMods[m].gfx  = gfx;
+        MemoryBarrier();                             // publish fields before the count
+        s_callerModCount = m + 1;
+    }
+    LeaveCriticalSection(&s_heapUseCS);
+    return gfx;
 }
 
 // Thread-local cache of the last heap touched — the common case is a run of allocs
@@ -1615,6 +1677,20 @@ static int ProxyHeapShardOf(LPCVOID p) {
     return -1;
 }
 
+// A shard's heap handle IS its base page (RtlCreateHeap over the carved slot).
+// If that page isn't committed RW, the shard's backing memory is gone — never
+// committed past shard 0, or later reclaimed — and any RtlAllocateHeap/RtlFreeHeap
+// on it faults reading the heap header (this is the launch-time RtlFreeHeap+0x6c
+// crash). Validate cheaply before touching a shard so a dead one is skipped, not
+// dereferenced.
+static bool ShardHandleLive(HANDLE h) {
+    if (!h) return false;
+    MEMORY_BASIC_INFORMATION mbi;
+    if (VirtualQuery(h, &mbi, sizeof(mbi)) != sizeof(mbi)) return false;
+    return mbi.State == MEM_COMMIT &&
+           !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD));
+}
+
 // RAII: mark in-hook for the duration of a shard op so the shard's own internal
 // work (growing → hooked NtAllocateVirtualMemory, any logging alloc) does NOT route
 // back into the sardine and re-enter the same heap → recursion / stack overflow.
@@ -1635,7 +1711,7 @@ static LPVOID ProxyHeapAlloc(ULONG flags, SIZE_T size) {
     LONG start = InterlockedIncrement(&s_proxyHeapRR);
     for (LONG k = 0; k < n; ++k) {
         HANDLE h = s_proxyHeaps[(start + k) % n];
-        if (!h) continue;
+        if (!ShardHandleLive(h)) continue;   // skip a shard whose pages are gone
         p = Real_RtlAllocateHeap(h, flags & HEAP_ZERO_MEMORY, size);
         if (p) break;
     }
@@ -1644,6 +1720,11 @@ static LPVOID ProxyHeapAlloc(ULONG flags, SIZE_T size) {
 static bool   ProxyHeapFree(ULONG flags, LPVOID p) {
     int s = ProxyHeapShardOf(p);
     if (s < 0) return false;
+    // Failsafe: never free into a shard whose backing pages aren't committed —
+    // RtlFreeHeap would fault on the heap header. Decline so the caller routes the
+    // arena pointer to FreeProxyAllocation (which safely no-ops an unknown arena
+    // pointer) instead of crashing. Worst case the block leaks; it never crashes.
+    if (!ShardHandleLive(s_proxyHeaps[s])) return false;
     ProxyHeapHookScope guard;
     // CRITICAL: drop HEAP_NO_SERIALIZE.  The shards are shared across every game thread
     // (round-robin capture), so a no-serialize free would skip the shard lock while other
@@ -1655,6 +1736,7 @@ static bool   ProxyHeapFree(ULONG flags, LPVOID p) {
 static LPVOID ProxyHeapReAlloc(ULONG flags, LPVOID p, SIZE_T size) {
     int s = ProxyHeapShardOf(p);
     if (s < 0) return nullptr;
+    if (!ShardHandleLive(s_proxyHeaps[s])) return nullptr;  // dead shard — fail, don't fault
     ProxyHeapHookScope guard;
     return Real_RtlReAllocateHeap(s_proxyHeaps[s], flags & HEAP_ZERO_MEMORY, p, size);
 }
@@ -1808,6 +1890,7 @@ static void RecordHeapBandBucket(SIZE_T size, const char* prefix) {
 
 PVOID NTAPI Hooked_RtlAllocateHeap(PVOID HeapHandle, ULONG Flags, SIZE_T Size)
 {
+    void* const callerRA = _ReturnAddress();   // immediate caller, for graphics exclusion
     InitProxyGrantLogCfg();
     if (TlsIsBootstrapping())
         return Real_RtlAllocateHeap(HeapHandle, Flags, Size);
@@ -1854,7 +1937,7 @@ PVOID NTAPI Hooked_RtlAllocateHeap(PVOID HeapHandle, ULONG Flags, SIZE_T Size)
     // (malloc-granular) instead of a 64KB arena slot each.  Exec heaps are skipped
     // (their allocs are code).  All shards full → fall through to the arena gate.
     if (ProxyHeapOn() && Size > 0 && Size < kHeapSubAllocMax && !ProxyHeapIsExecHeap(HeapHandle)
-        && !HeapIsSardineExcluded(HeapHandle)) {
+        && !HeapIsSardineExcluded(HeapHandle) && !CallerIsGraphicsModule(callerRA)) {
         PVOID hp = ProxyHeapAlloc(Flags, Size);
         if (hp) {
             if (Analytics::GetInstance()) {
@@ -2001,6 +2084,15 @@ BOOLEAN NTAPI Hooked_RtlFreeHeap(PVOID HeapHandle, ULONG Flags, PVOID HeapBase)
 PVOID NTAPI Hooked_RtlReAllocateHeap(PVOID HeapHandle, ULONG Flags,
                                       PVOID HeapBase, SIZE_T Size)
 {
+    // Re-entrancy guard FIRST. RtlReAllocateHeap does its block-move bookkeeping by
+    // re-entering the patched PUBLIC heap entries; if we route that back into the
+    // shard fast-path we recurse into ProxyHeapReAlloc until the stack overflows
+    // (the c00000fd crash). When already inside a hook — or bootstrapping/shutting
+    // down — use the real heap on the handle ntdll passed and never re-route.
+    if (TlsIsBootstrapping() || s_tlHookActive || IsInHook() || !s_memManager ||
+        WorkingHooks::IsShuttingDown())
+        return Real_RtlReAllocateHeap(HeapHandle, Flags, HeapBase, Size);
+
     // Proxy-heap sub-allocation: realloc within the owning shard (route by address).
     // Null return = standard realloc-failure (original block left intact).
     if (HeapBase && ProxyHeapShardOf(HeapBase) >= 0)
@@ -2926,8 +3018,45 @@ BOOL WINAPI Hooked_HeapUnlock(HANDLE hHeap)
     return ok;
 }
 
+// Global*/Local* movable allocations (GMEM_MOVEABLE/LMEM_MOVEABLE) link a user value
+// onto the block via RtlSetUserValueHeap, which only succeeds if the block is a REAL
+// heap block. We hook these solely to run them with proxy/sardine redirection SUPPRESSED
+// (save/restore the in-hook flag) so their internal RtlAllocateHeap/ReAlloc returns a
+// genuine heap block — otherwise the block lands in a shard and RtlSetUserValueHeap
+// faults with "Invalid address" (seen via DSOUND/msacm32 audio-driver enum at startup).
+// These paths are rare (DSOUND ≈ 2 allocs/session) so bypassing the sardine costs nothing.
+HGLOBAL WINAPI Hooked_GlobalAlloc(UINT uFlags, SIZE_T dwBytes) {
+    if (!Real_GlobalAlloc) return nullptr;
+    const bool was = IsInHook(); if (!was) SetInHook(true);
+    HGLOBAL h = Real_GlobalAlloc(uFlags, dwBytes);
+    if (!was) SetInHook(false);
+    return h;
+}
+HGLOBAL WINAPI Hooked_GlobalReAlloc(HGLOBAL hMem, SIZE_T dwBytes, UINT uFlags) {
+    if (!Real_GlobalReAlloc) return nullptr;
+    const bool was = IsInHook(); if (!was) SetInHook(true);
+    HGLOBAL h = Real_GlobalReAlloc(hMem, dwBytes, uFlags);
+    if (!was) SetInHook(false);
+    return h;
+}
+HLOCAL WINAPI Hooked_LocalAlloc(UINT uFlags, SIZE_T uBytes) {
+    if (!Real_LocalAlloc) return nullptr;
+    const bool was = IsInHook(); if (!was) SetInHook(true);
+    HLOCAL h = Real_LocalAlloc(uFlags, uBytes);
+    if (!was) SetInHook(false);
+    return h;
+}
+HLOCAL WINAPI Hooked_LocalReAlloc(HLOCAL hMem, SIZE_T uBytes, UINT uFlags) {
+    if (!Real_LocalReAlloc) return nullptr;
+    const bool was = IsInHook(); if (!was) SetInHook(true);
+    HLOCAL h = Real_LocalReAlloc(hMem, uBytes, uFlags);
+    if (!was) SetInHook(false);
+    return h;
+}
+
 LPVOID WINAPI Hooked_HeapAlloc(HANDLE hHeap, DWORD dwFlags, SIZE_T dwBytes)
 {
+    void* const callerRA = _ReturnAddress();   // immediate caller, for graphics exclusion
     if (TlsIsBootstrapping() || s_tlHookActive || IsInHook() || WorkingHooks::IsShuttingDown() || !Real_HeapAlloc)
         return Real_HeapAlloc ? Real_HeapAlloc(hHeap, dwFlags, dwBytes) : nullptr;
 
@@ -2945,7 +3074,7 @@ LPVOID WINAPI Hooked_HeapAlloc(HANDLE hHeap, DWORD dwFlags, SIZE_T dwBytes)
     // smashed when the driver hands the pointer to the GPU/kernel (xcpt DRAKKAR
     // 26-06-05: AMDXN32 -> Hooked_HeapAlloc -> ProxyHeapAlloc -> ntdll heap AV).
     if (ProxyHeapOn() && dwBytes > 0 && dwBytes < kHeapSubAllocMax && !ProxyHeapIsExecHeap(hHeap)
-        && !HeapIsSardineExcluded(hHeap)) {
+        && !HeapIsSardineExcluded(hHeap) && !CallerIsGraphicsModule(callerRA)) {
         p = ProxyHeapAlloc(dwFlags, dwBytes);
         if (p && Analytics::GetInstance()) {
             Analytics::GetInstance()->IncrementCounter("ProxyHeap_Alloc");
@@ -3682,6 +3811,10 @@ bool WorkingHooks::Install(MemoryManager* memManager)
     Real_HeapWalk                = (HeapWalk_t)               GetProcAddress(hKernel32, "HeapWalk");
     Real_HeapLock                = (HeapLock_t)               GetProcAddress(hKernel32, "HeapLock");
     Real_HeapUnlock              = (HeapUnlock_t)             GetProcAddress(hKernel32, "HeapUnlock");
+    Real_GlobalAlloc             = (GlobalAlloc_t)            GetProcAddress(hKernel32, "GlobalAlloc");
+    Real_GlobalReAlloc           = (GlobalReAlloc_t)          GetProcAddress(hKernel32, "GlobalReAlloc");
+    Real_LocalAlloc              = (LocalAlloc_t)             GetProcAddress(hKernel32, "LocalAlloc");
+    Real_LocalReAlloc            = (LocalReAlloc_t)           GetProcAddress(hKernel32, "LocalReAlloc");
     Real_MapViewOfFile           = (MapViewOfFile_t)          GetProcAddress(hKernel32, "MapViewOfFile");
     Real_MapViewOfFileEx         = (MapViewOfFileEx_t)        GetProcAddress(hKernel32, "MapViewOfFileEx");
     Real_UnmapViewOfFile         = (UnmapViewOfFile_t)        GetProcAddress(hKernel32, "UnmapViewOfFile");
@@ -3738,6 +3871,14 @@ bool WorkingHooks::Install(MemoryManager* memManager)
         Real_HeapLock = (HeapLock_t)GetProcAddress(hKernelBase, "HeapLock");
     if (!Real_HeapUnlock && hKernelBase)
         Real_HeapUnlock = (HeapUnlock_t)GetProcAddress(hKernelBase, "HeapUnlock");
+    if (!Real_GlobalAlloc && hKernelBase)
+        Real_GlobalAlloc = (GlobalAlloc_t)GetProcAddress(hKernelBase, "GlobalAlloc");
+    if (!Real_GlobalReAlloc && hKernelBase)
+        Real_GlobalReAlloc = (GlobalReAlloc_t)GetProcAddress(hKernelBase, "GlobalReAlloc");
+    if (!Real_LocalAlloc && hKernelBase)
+        Real_LocalAlloc = (LocalAlloc_t)GetProcAddress(hKernelBase, "LocalAlloc");
+    if (!Real_LocalReAlloc && hKernelBase)
+        Real_LocalReAlloc = (LocalReAlloc_t)GetProcAddress(hKernelBase, "LocalReAlloc");
     if (!Real_MapViewOfFile && hKernelBase)
         Real_MapViewOfFile = (MapViewOfFile_t)GetProcAddress(hKernelBase, "MapViewOfFile");
     if (!Real_MapViewOfFileEx && hKernelBase)
@@ -3811,6 +3952,10 @@ bool WorkingHooks::Install(MemoryManager* memManager)
     if (Real_HeapFree)        DetourAttach(&(PVOID&)Real_HeapFree,        Hooked_HeapFree);
     if (Real_HeapReAlloc)     DetourAttach(&(PVOID&)Real_HeapReAlloc,     Hooked_HeapReAlloc);
     if (Real_HeapCreate)      DetourAttach(&(PVOID&)Real_HeapCreate,      Hooked_HeapCreate);
+    if (Real_GlobalAlloc)     DetourAttach(&(PVOID&)Real_GlobalAlloc,     Hooked_GlobalAlloc);
+    if (Real_GlobalReAlloc)   DetourAttach(&(PVOID&)Real_GlobalReAlloc,   Hooked_GlobalReAlloc);
+    if (Real_LocalAlloc)      DetourAttach(&(PVOID&)Real_LocalAlloc,      Hooked_LocalAlloc);
+    if (Real_LocalReAlloc)    DetourAttach(&(PVOID&)Real_LocalReAlloc,    Hooked_LocalReAlloc);
 #ifdef TS3VAS_TELEMETRY   // observe-only HeapDestroy: not installed in the play build
     if (Real_HeapDestroy)     DetourAttach(&(PVOID&)Real_HeapDestroy,     Hooked_HeapDestroy);
 #endif
@@ -3931,6 +4076,10 @@ void WorkingHooks::Uninstall()
     if (Real_HeapFree)        DetourDetach(&(PVOID&)Real_HeapFree,        Hooked_HeapFree);
     if (Real_HeapReAlloc)     DetourDetach(&(PVOID&)Real_HeapReAlloc,     Hooked_HeapReAlloc);
     if (Real_HeapCreate)      DetourDetach(&(PVOID&)Real_HeapCreate,      Hooked_HeapCreate);
+    if (Real_GlobalAlloc)     DetourDetach(&(PVOID&)Real_GlobalAlloc,     Hooked_GlobalAlloc);
+    if (Real_GlobalReAlloc)   DetourDetach(&(PVOID&)Real_GlobalReAlloc,   Hooked_GlobalReAlloc);
+    if (Real_LocalAlloc)      DetourDetach(&(PVOID&)Real_LocalAlloc,      Hooked_LocalAlloc);
+    if (Real_LocalReAlloc)    DetourDetach(&(PVOID&)Real_LocalReAlloc,    Hooked_LocalReAlloc);
 #ifdef TS3VAS_TELEMETRY
     if (Real_HeapDestroy)     DetourDetach(&(PVOID&)Real_HeapDestroy,     Hooked_HeapDestroy);
 #endif

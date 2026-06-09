@@ -13,6 +13,17 @@ static bool s_loggerConstructed = false;
 // share the same MMDD_HHMM stamp regardless of when they're first written.
 static char s_sessionStamp[16] = {};
 
+#ifndef TS3VAS_TELEMETRY
+// Play build only: the main log file is created LAZILY, on the first ERROR/crash
+// write, so a normal session leaves NO files behind. Path is built in Init().
+static char s_mainLogPath[MAX_PATH] = {};
+static HANDLE EnsureLazyLogFile(HANDLE cur) {
+    if (cur != INVALID_HANDLE_VALUE || !s_mainLogPath[0]) return cur;
+    return CreateFileA(s_mainLogPath, GENERIC_WRITE, FILE_SHARE_READ, NULL,
+                       CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, NULL);
+}
+#endif
+
 static bool ShouldSuppressConsoleNamed(const char* logName) {
     if (!logName) return false;
     // High-volume observe-only channels: keep them in their files, off the live
@@ -140,15 +151,16 @@ void Logger::Init(const char* logName) {
     // Store the session stamp once — all named logs will reuse it.
     wsprintfA(s_sessionStamp, "%02d%02d_%02d%02d", st.wMonth, st.wDay, st.wHour, st.wMinute);
 
+#ifdef TS3VAS_TELEMETRY
     char logPath[MAX_PATH];
     wsprintfA(logPath, "C:\\ts3_tool\\%s_%s.txt", logName, s_sessionStamp);
     EmergencyLogF("Logger", "Log path constructed: %s", logPath);
-    
+
     EmergencyLog("Logger", "Calling CreateFileA");
     m_hFile = CreateFileA(logPath, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS,
                           FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, NULL);
     EmergencyLogF("Logger", "CreateFileA returned. Handle: 0x%p", m_hFile);
-    
+
     m_initialized = true;
 
     if (m_hFile == INVALID_HANDLE_VALUE) {
@@ -156,12 +168,28 @@ void Logger::Init(const char* logName) {
     } else {
         Info("Logger initialized. Log file: %s", logPath);
     }
+#else
+    // Play build: stay silent. Defer file creation to the first ERROR/crash write
+    // (Log()), so a normal session writes nothing. Routine Info/Warn/Named are
+    // no-ops; only the crash dump lands here, in xcpt_<stamp>.txt.
+    (void)logName;
+    wsprintfA(s_mainLogPath, "C:\\ts3_tool\\xcpt_%s.txt", s_sessionStamp);
+    m_hFile = INVALID_HANDLE_VALUE;
+    m_initialized = true;
+#endif
 }
 
 void Logger::Log(const char* level, const char* fmt, va_list args) {
     if (!m_initialized) {
         return;
     }
+
+#ifndef TS3VAS_TELEMETRY
+    // Play build: silent except for ERROR/crash output. Routine Info/Warn drop
+    // here; the first ERROR lazily creates the xcpt file.
+    if (strcmp(level, "ERROR") != 0) return;
+    if (m_hFile == INVALID_HANDLE_VALUE) m_hFile = EnsureLazyLogFile(m_hFile);
+#endif
 
     EnterCriticalSection(&m_logCS);
 
@@ -199,6 +227,11 @@ void Logger::LogNamed(const char* logName, const char* level, const char* fmt, v
         return;
     }
 
+#ifndef TS3VAS_TELEMETRY
+    // Play build: no per-channel telemetry files (ANALYTICS_REPORT, VAS_*, etc.).
+    (void)level; (void)fmt; (void)args;
+    return;
+#else
     const char* fileTarget = ResolveNamedLogTarget(logName);
     if (!fileTarget || !*fileTarget) fileTarget = logName;
 
@@ -245,6 +278,7 @@ void Logger::LogNamed(const char* logName, const char* level, const char* fmt, v
     }
 
     LeaveCriticalSection(&m_logCS);
+#endif // TS3VAS_TELEMETRY
 }
 
 void Logger::Info(const char* fmt, ...) {

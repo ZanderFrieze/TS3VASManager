@@ -31,6 +31,7 @@ EmergencyLogger::EmergencyLogger() : m_hFile(INVALID_HANDLE_VALUE) {
     InitializeCriticalSection(&m_cs);
     CreateLogDirectoryWithOpenPermissions();
 
+#ifdef TS3VAS_TELEMETRY
     // Unique per-launch filename: main_log_MMDD_HHMM.txt
     // FILE_FLAG_WRITE_THROUGH so every write survives a crash without a flush call.
     SYSTEMTIME st;
@@ -46,6 +47,10 @@ EmergencyLogger::EmergencyLogger() : m_hFile(INVALID_HANDLE_VALUE) {
                           OPEN_ALWAYS,
                           FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH,
                           NULL);
+#endif
+    // Play build (TS3VAS_TELEMETRY=OFF): no main_log file. m_hFile stays INVALID,
+    // so WriteLog() no-ops — the play build's only output is the crash xcpt file
+    // (Logger ERROR path). Keeps "just play" silent during normal sessions.
 }
 
 EmergencyLogger::~EmergencyLogger() {
