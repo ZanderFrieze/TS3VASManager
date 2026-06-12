@@ -60,6 +60,7 @@ TS3VASManager checks the following system environment variables at initializatio
 | `TS3VAS_HITCH_FREE_THRESHOLD` | `20000` | Performance evaluation threshold checking for prolonged heap deallocation requests. |
 | `TS3VAS_GC_PRESSURE_MB` | `1024` | The largest-free VAS threshold (in MB) below which the proactive Mono garbage-collection pressure routine fires more aggressively. |
 | `TS3VAS_GC_INTERVAL_SEC` | `60` | The basic interval period (in seconds) used to routinely prompt the managed scripting garbage collector when the environment has ample free address space. |
+| `TS3VAS_PASSIVE` | `0` | Set to `1` (or drop an empty `passive.flag` file in `C:\ts3_tool\`) for a fully passive, observe-only baseline: the proxy arena, allocation hooks, sardine shards, Mono-GC pushes, the D3D9 hook and the priority bump are all **disabled**, leaving only the `total_free` / `largest_free` VAS readout so you can capture an "untooled" reference run. |
 
 ---
 
@@ -108,9 +109,11 @@ To make the testing conditions transparent, the repository includes a real captu
 
 A companion line graph captures `largest_free` / `total_free` VAS alongside the managed script-heap, so allocation pressure and the loaded content can be read together:
 
-![VAS over a session — three runs, three metrics each](docs/vas_comparison.png)
+![VAS over a session — three tooled runs plus an untooled baseline](docs/vas_comparison.png)
 
-Nine lines: **three real play sessions, three metrics each.** Each run is a base colour — **red** = Main PC (v1.67) under the full content catalog, **green** = Main PC (v1.67) on a fresh Riverview save, **blue** = ROG Ally X handheld (v1.69) on a fresh Riverview save. Within a run, the three shades are `largest_free` (darkest), `total_free` (mid) and `script_heap` (lightest). Each session is plotted at its **full, individual length** (the length is the point), with the current **2–3 hour recommended window shaded** for reference — every line runs well past it, to 5:10, 5:33 and 6:02. The raw data and the script that produced this chart live in [`docs/vas_comparison.csv`](docs/vas_comparison.csv) and [`docs/make_vas_graph.py`](docs/make_vas_graph.py).
+**Four real play sessions.** Three are **tooled** runs (proxy active), each a base colour with three metrics — **red** = Main PC (v1.67) under the full content catalog, **green** = Main PC (v1.67) on a fresh Riverview save, **blue** = ROG Ally X handheld (v1.69) on a fresh Riverview save; within a run the three shades are `largest_free` (darkest), `total_free` (mid) and `script_heap` (lightest). The fourth, in **purple**, is an **untooled baseline** — the same Main PC (v1.67) full-catalog load with the tool in passive mode, so it has only two lines (`largest_free` and `total_free`; with no proxy there is no managed-heap bridge to report `script_heap`). It is the "pre-tool" reference, and the contrast is the point: its `largest_free` collapses to ~33 MB inside ~4.7 h, far below where every tooled run holds. Each session is plotted at its **full, individual length**, with the current **2–3 hour recommended window shaded** for reference. The raw data and the script that produced this chart live in [`docs/vas_comparison.csv`](docs/vas_comparison.csv) and [`docs/make_vas_graph.py`](docs/make_vas_graph.py).
+
+> **🧪 Want to capture your own untooled baseline?** Drop an empty file named **`passive.flag`** into `C:\ts3_tool\` *before launching* (its presence is checked once at startup), then run the telemetry build (`TS3VASManager.dll`). The tool goes fully passive and observe-only — the proxy arena, allocation hooks, sardine shards, Mono-GC pushes, the D3D9 hook and the HIGH-priority bump are **all disabled** — so the game runs untouched while the heartbeat still logs `total_free` / `largest_free` to a `VAS_COMBINED_*.txt` timeline you can feed straight into [`make_vas_graph.py`](docs/make_vas_graph.py). Delete the file to restore the full tool. (`TS3VAS_PASSIVE=1` does the same, but the file is more dependable — env vars don't always survive the launcher's pre-OEP injection.) Note: with the D3D9 hook off, the device-lost crash shield is inactive, so a passive run can crash on a driver hiccup where the full tool would recover — expected for a true "no tool" measurement.
 
 ### How to read the VAS numbers in the graph
 

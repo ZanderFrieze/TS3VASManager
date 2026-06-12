@@ -642,7 +642,11 @@ DWORD WINAPI HeartbeatMonitor::HeartbeatThreadFunc(LPVOID param) {
     EmergencyLog("HeartbeatMonitor", "Thread function started");
 
     HeartbeatMonitor* self = static_cast<HeartbeatMonitor*>(param);
-    ProxyGc::Init();   // create the Mono-collect-request event + read tunables (once)
+    // Observe-only baseline: poll + log the two VAS metrics and nothing else — no
+    // GC pushes, observe-table scans, slope/phase/leak telemetry, or proxy stats.
+    const bool passive = WorkingHooks::IsPassiveMode();
+    if (!passive)
+        ProxyGc::Init();   // create the Mono-collect-request event + read tunables (once)
     DWORD beat_count = 0;
     DWORD last_vas_mb = 0;
     uint64_t prevWriteWatchExecBytes = 0;
@@ -728,7 +732,7 @@ DWORD WINAPI HeartbeatMonitor::HeartbeatThreadFunc(LPVOID param) {
         if (InterlockedCompareExchange(&self->m_stopFlag, 0, 0) != 0) break;
         beat_count++;
 
-        if (ObserveTablesEnabled()) {
+        if (!passive && ObserveTablesEnabled()) {
             LogObserveTables(self->m_memManager);
             // HEAP_USAGE + GFX_CORRAL are coarse pictures — throttle them to once
             // every 5 minutes instead of every observe tick.
@@ -768,6 +772,19 @@ DWORD WINAPI HeartbeatMonitor::HeartbeatThreadFunc(LPVOID param) {
                 lfRingHead = (lfRingHead + 1) % kLfRing;
                 if (lfRingCount < kLfRing) lfRingCount++;
             }
+        }
+
+        // Observe-only baseline: emit just the two VAS metrics for the graph, then
+        // skip every other path (GC push, proxy stats, slope, milestones, phase
+        // machine, leak hunter, analytics) so the run stays fully non-intervening.
+        if (passive) {
+            int vas_delta = (int)(current_vas_mb - last_vas_mb);
+            const char* vas_dir = (vas_delta >= 0) ? "+" : "";
+            Logger::GetInstance()->NamedInfo("VAS_REPORT",
+                "Local VAS: total_free=%lu MB largest_free=%lu MB delta=%s%d",
+                current_vas_mb, largest_free_mb, vas_dir, vas_delta);
+            last_vas_mb = current_vas_mb;
+            continue;
         }
 
         // Tell Mono it's under pressure (it can't see native VAS itself) so it

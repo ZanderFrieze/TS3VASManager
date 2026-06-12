@@ -653,7 +653,28 @@ static void MaybeLogProxyGrantTally() {
         totalCnt, (unsigned long long)(totalBytes / (1024 * 1024)));
 }
 
-void WorkingHooks::ActivateProxy() { InterlockedExchange(&s_proxyActive, 1); }
+bool WorkingHooks::IsPassiveMode() {
+    static volatile LONG s_passiveInit = 0;
+    static volatile LONG s_passiveOn   = 0;
+    if (InterlockedCompareExchange(&s_passiveInit, 1, 0) == 0) {
+        LONG on = 0;
+        char v[16] = {};
+        DWORD n = GetEnvironmentVariableA("TS3VAS_PASSIVE", v, (DWORD)sizeof(v));
+        if (n > 0 && (v[0]=='1'||v[0]=='y'||v[0]=='Y'||v[0]=='t'||v[0]=='T'))
+            on = 1;
+        // Env vars don't always survive the launcher's pre-OEP injection, so a
+        // sentinel file in the log dir is the reliable fallback — either engages it.
+        if (!on && GetFileAttributesA("C:\\ts3_tool\\passive.flag") != INVALID_FILE_ATTRIBUTES)
+            on = 1;
+        InterlockedExchange(&s_passiveOn, on);
+    }
+    return InterlockedCompareExchange(&s_passiveOn, 0, 0) != 0;
+}
+
+void WorkingHooks::ActivateProxy() {
+    if (IsPassiveMode()) return;   // baseline mode: proxy stays inert, nothing redirected
+    InterlockedExchange(&s_proxyActive, 1);
+}
 bool WorkingHooks::IsProxyActive()  { return InterlockedCompareExchange(&s_proxyActive, 0, 0) == 1; }
 bool WorkingHooks::IsShuttingDown() { return InterlockedCompareExchange(&s_shuttingDown, 0, 0) != 0; }
 
@@ -1622,6 +1643,10 @@ static inline bool ProxyHeapOn() { return s_proxyHeapEnabled != 0; }
 
 static void ProxyHeapInit() {
     if (InterlockedCompareExchange(&s_proxyHeapInit, 1, 0) != 0) return;
+    if (WorkingHooks::IsPassiveMode()) {
+        EmergencyLog("ProxyHeap", "sub-allocator OFF (passive baseline mode — no shard reservation)");
+        return;
+    }
     char v[16] = {};
     DWORD n = GetEnvironmentVariableA("TS3VAS_PROXY_HEAP_SUBALLOC", v, (DWORD)sizeof(v));
     // Default ON now (env propagation through the launcher is unreliable).  Only OFF
