@@ -114,7 +114,15 @@ void StartPatch() {
         logger->Info("==================================================================");
         logger->Info("[PHASE_1] Logger initialized.");
 
-        if (SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS))
+        // Observe-only baseline (TS3VAS_PASSIVE / C:\ts3_tool\passive.flag): the tool
+        // must not alter the run at all, so it skips the proxy, the GC pushes, the
+        // D3D9 hook, the priority bump, and the heavy telemetry — only the VAS readout
+        // (total_free/largest_free) runs.  Default OFF.
+        const bool passiveMode = WorkingHooks::IsPassiveMode();
+
+        if (passiveMode)
+            logger->Info("[PHASE_1] Process priority left at default (passive baseline).");
+        else if (SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS))
             logger->Info("[PHASE_1] Process priority set to HIGH.");
         else
             logger->Warn("[PHASE_1] SetPriorityClass failed. GLE=%lu", GetLastError());
@@ -129,13 +137,19 @@ void StartPatch() {
 
         // PHASE 3 — proxy arena (local-only: a single private arena with
         // eager-committed slots; allocations are contained, never evicted).
-        logger->Info("[PHASE_3] Initializing proxy memory manager...");
-        g_memoryManager = new MemoryManager();
-        if (!g_memoryManager->Initialize()) {
-            logger->Error("[PHASE_3] CRITICAL: proxy arena init failed!");
-            StopPatch(); return;
+        if (passiveMode) {
+            logger->Info("[PHASE_3] PASSIVE baseline mode (TS3VAS_PASSIVE / passive.flag): "
+                         "proxy arena, redirect hooks, and sardine shards DISABLED — "
+                         "logging total_free/largest_free only.");
+        } else {
+            logger->Info("[PHASE_3] Initializing proxy memory manager...");
+            g_memoryManager = new MemoryManager();
+            if (!g_memoryManager->Initialize()) {
+                logger->Error("[PHASE_3] CRITICAL: proxy arena init failed!");
+                StopPatch(); return;
+            }
+            logger->Info("[PHASE_3] Proxy memory manager ready.");
         }
-        logger->Info("[PHASE_3] Proxy memory manager ready.");
 
         // PHASE 4 — top-level crash-logging exception filter
         logger->Info("[PHASE_4] Installing exception handler...");
@@ -143,28 +157,37 @@ void StartPatch() {
         g_exceptionHandler->Install();
         logger->Info("[PHASE_4] Exception handler installed.");
 
-        // PHASE 5 — Hooks (Rtl + ReadFile, active immediately — no D3D9 wait)
-        logger->Info("[PHASE_5] Installing hooks...");
-        g_hookManager = new HookManager(g_memoryManager);
-        if (!g_hookManager->InstallAndEnableHooks()) {
-            logger->Error("[PHASE_5] CRITICAL: Hook installation failed!");
-            StopPatch(); return;
-        }
+        // PHASE 5 — Hooks (Rtl + ReadFile, active immediately — no D3D9 wait).
+        // Skipped entirely in passive baseline mode so no allocation is redirected.
+        if (passiveMode) {
+            logger->Info("[PHASE_5] Allocation hooks NOT installed (passive baseline) — "
+                         "the game's allocators run untouched.");
+        } else {
+            logger->Info("[PHASE_5] Installing hooks...");
+            g_hookManager = new HookManager(g_memoryManager);
+            if (!g_hookManager->InstallAndEnableHooks()) {
+                logger->Error("[PHASE_5] CRITICAL: Hook installation failed!");
+                StopPatch(); return;
+            }
 
-        // Activate proxy immediately — hooks are live so every allocation is
-        // now visible.  Previously activation waited for beat 10/15 (~20-30s),
-        // meaning the first 42+ large allocations during game load went
-        // unproxied and fragmented the heap before we could intervene.
-        WorkingHooks::ActivateProxy();
-        logger->Info("[HOOKS] All hooks installed and live — RtlAllocateHeap catching all heap allocations from process start.");
+            // Activate proxy immediately — hooks are live so every allocation is
+            // now visible.  Previously activation waited for beat 10/15 (~20-30s),
+            // meaning the first 42+ large allocations during game load went
+            // unproxied and fragmented the heap before we could intervene.
+            WorkingHooks::ActivateProxy();
+            logger->Info("[HOOKS] All hooks installed and live — RtlAllocateHeap catching all heap allocations from process start.");
+        }
 
         // Start heartbeat immediately (no PatchActivator needed)
         g_heartbeatMonitor = new HeartbeatMonitor(g_memoryManager);
         g_heartbeatMonitor->Start();
         StackWalker::GetInstance()->Start();
 
-        logger->Info("[PHASE_5] All hooks live. RtlAllocateHeap active from process start.");
-        if (EnvFlagEnabled("TS3VAS_ENABLE_D3D9_HOOK", true)) {
+        if (!passiveMode)
+            logger->Info("[PHASE_5] All hooks live. RtlAllocateHeap active from process start.");
+        if (passiveMode) {
+            logger->Info("[PHASE_5] D3D9 hook NOT installed (passive baseline — game renders untouched, no device-lost shield).");
+        } else if (EnvFlagEnabled("TS3VAS_ENABLE_D3D9_HOOK", true)) {
             ObserverHooks::Install();
             logger->Info("[PHASE_5] D3D9 hook enabled (default ON; set TS3VAS_ENABLE_D3D9_HOOK=0 to disable) — Present telemetry + CPU/GPU resource table.");
         } else {
@@ -172,7 +195,10 @@ void StartPatch() {
         }
         logger->Flush(); // flush immediately — process may exit before the block below
         logger->Info("==================================================================");
-        logger->Info("  TS3VASManager: Rtl* + Nt* + VirtualAlloc* + VirtualProtect/Query/Lock + Heap* + MapView/CreateFileMapping/OpenFileMapping/Flush hooked");
+        if (passiveMode)
+            logger->Info("  TS3VASManager: PASSIVE baseline — no allocation hooks; VAS readout only.");
+        else
+            logger->Info("  TS3VASManager: Rtl* + Nt* + VirtualAlloc* + VirtualProtect/Query/Lock + Heap* + MapView/CreateFileMapping/OpenFileMapping/Flush hooked");
         logger->Info("  No D3D9 activation trigger required.");
         logger->Info("==================================================================");
         logger->Flush();

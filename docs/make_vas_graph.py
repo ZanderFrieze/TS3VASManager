@@ -33,11 +33,15 @@ RUNS = [
         {"largest_free": "#0A7A0A", "total_free": "#3FB23F", "script_heap": "#A6DFA6"}),
     ("ALLY X run.txt", "ROG Ally X · v1.69 · Riverview",
         {"largest_free": "#103FB0", "total_free": "#4F7FE6", "script_heap": "#AFC4F5"}),
+    # Untooled baseline (passive mode): no proxy, so no script_heap is logged.
+    ("Untooled baseline.txt", "Main PC · v1.67 · UNTOOLED (no proxy)",
+        {"largest_free": "#7A2F9E", "total_free": "#B574D1"}),
 ]
 
+# script_heap is optional: the untooled/passive runs don't emit it.
 LINE = re.compile(
     r"^\[(\d{2}):(\d{2}):(\d{2})\.(\d{3})\].*?VAS_REPORT\] Local VAS: "
-    r"total_free=(\d+) MB largest_free=(\d+) MB.*?script_heap=(\d+) MB")
+    r"total_free=(\d+) MB largest_free=(\d+) MB(?:.*?script_heap=(\d+) MB)?")
 
 def hm(mins):
     """elapsed minutes -> H:MM time label (:30, 1:00, 1:30, 6:02 ...)."""
@@ -61,13 +65,16 @@ def parse(path):
         e = t - t0
         if e < 0:                       # guard against midnight wrap
             e += 24*3600
-        rows.append((e/60.0, int(tf), int(lf), int(sh)))
+        rows.append((e/60.0, int(tf), int(lf), int(sh) if sh else 0))
     # drop trailing shutdown snapshot(s): once Mono unloads, script_heap reads 0
     # again and free VAS spikes -- not gameplay, so trim from the last sh>0 sample.
-    last = len(rows) - 1
-    while last > 0 and rows[last][3] == 0:
-        last -= 1
-    return rows[:last+1]
+    # Skip this for untooled runs (script_heap always 0) or it eats the whole run.
+    if any(r[3] > 0 for r in rows):
+        last = len(rows) - 1
+        while last > 0 and rows[last][3] == 0:
+            last -= 1
+        rows = rows[:last+1]
+    return rows
 
 plt.figure(figsize=(14, 8))
 all_csv = []
@@ -86,8 +93,9 @@ for fname, desc, shades in RUNS:
              label=f"{desc} — ended ~{ended} — largest_free")
     plt.plot(xs, tf, color=shades["total_free"], linewidth=1.4,
              label="      — total_free")
-    plt.plot(xs, sh, color=shades["script_heap"], linewidth=1.4,
-             label="      — script_heap")
+    if "script_heap" in shades:
+        plt.plot(xs, sh, color=shades["script_heap"], linewidth=1.4,
+                 label="      — script_heap")
     max_x = max(max_x, xs[-1])
     max_y = max(max_y, max(tf))
     print(f"{fname:24s} span={xs[-1]/60:.2f}h ({ended})  start_lf={lf[0]} end_lf={lf[-1]}  samples={len(rows)}")

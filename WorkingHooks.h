@@ -31,6 +31,14 @@ namespace WorkingHooks {
     bool IsShuttingDown();
     void ActivateProxy();   // called by heartbeat after stable startup
     bool IsProxyActive();
+
+    // Observe-only baseline: when ON, the proxy never activates and the sardine
+    // sub-allocator never reserves, so nothing is redirected and the tool adds no
+    // VAS footprint — the heartbeat still logs total_free/largest_free, giving a
+    // clean "pre-tool" reference line for the comparison graph.  Engaged by env
+    // TS3VAS_PASSIVE=1 or a C:\ts3_tool\passive.flag sentinel (env propagation
+    // through the launcher is unreliable, so either trigger works).  Default OFF.
+    bool IsPassiveMode();
     void ReportAllocCallsites(const char* logName);
     void ReportLocalVasSources(const char* logName);
     void ReportProxyHeapUsage(const char* logName);   // sardine sub-allocator shards
